@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -28,29 +29,57 @@ const (
 
 )
 
+var bubblebagsURLMap = make(map[string]string)
+
 func main() {
 	apiKey := os.Getenv("WB_API_KEY")
 	if apiKey == "" {
 		log.Fatal("Перед запуском необходимо установить переменную окружения API_KEY")
 	}
-
-	cfg := Config{
-		ObjectIDs: []int{3979},
-
-		DBName:            "unit_ec.db",
-		VendorCodePattern: "^box_\\d+_\\d+$",
-		UsePcs:            true,
+	if err := loadBubblebagsCSV(); err != nil {
+		log.Fatalf("Ошибка загрузки URL из CSV: %v", err)
 	}
 
-	// err := Process(apiKey, cfg)
-	// if err != nil {
-	// 	log.Fatalf("Ошибка при обработке: %v", err)
-	// }
+	cfg := Config{
+		ObjectIDs: []int{3979, 3756},
 
-	err := updateStocks(apiKey, cfg)
+		DBName: "unit_ec.db",
+		VendorCodePatterns: []string{
+			"^box_\\d+_\\d+$",
+			"^bubblebags_9\\d+_\\d+$",
+			"^bubblebags_1\\d+_\\d+$",
+		},
+		UsePcs: true,
+	}
+
+	err := Process(apiKey, cfg)
+	if err != nil {
+		log.Fatalf("Ошибка при обработке: %v", err)
+	}
+
+	err = updateStocks(apiKey, cfg)
 	if err != nil {
 		log.Fatalf("Ошибка при обновлении стоки: %v", err)
 	}
+}
+
+func loadBubblebagsCSV() error {
+	file, err := os.Open("urls.csv")
+	if err != nil {
+		return fmt.Errorf("ошибка при открытии файла urls.csv: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ",")
+		if len(parts) == 2 {
+			// Пример: "bubblebags_19323,https://packio.ru/product/paket..."
+			bubblebagsURLMap[parts[0]] = parts[1]
+		}
+	}
+	return scanner.Err()
 }
 
 func updateStocks(apiKey string, cfg Config) error {
@@ -143,7 +172,8 @@ func updateStocks(apiKey string, cfg Config) error {
 			log.Printf("✅ Успешно обновлены остатки для %d товаров\n", len(batch))
 		} else {
 			// В случае ошибки читаем тело ответа (по желанию), но здесь просто выведем Status
-			log.Printf("❌ Ошибка при обновлении: статус %d\n", resp.StatusCode)
+			b, _ := ioutil.ReadAll(resp.Body)
+			log.Printf("❌ Ошибка при обновлении: статус %d  тело ответа: %s\n", resp.StatusCode, string(b))
 		}
 		resp.Body.Close()
 
@@ -158,9 +188,9 @@ func updateStocks(apiKey string, cfg Config) error {
 type Config struct {
 	ObjectIDs []int // SubjectIDs
 
-	DBName            string // DBName (for example, "ue.db")
-	VendorCodePattern string // VendorCodePattern (for example, "^box_\d+_\d+$")
-	UsePcs            bool   // UsePcs (for example, true)
+	DBName             string   // DBName (for example, "ue.db")
+	VendorCodePatterns []string // VendorCodePattern (for example, "^box_\d+_\d+$")
+	UsePcs             bool     // UsePcs (for example, true)
 }
 
 const baseURL = "https://sp.cargo-avto.ru/catalog/"
@@ -197,13 +227,21 @@ func Process(apiKey string, cfg Config) error {
 
 	productDataCache := make(map[string]map[string]string)
 	skuMap := extractSKUs(allCards)
-	vendorCodePattern := regexp.MustCompile(cfg.VendorCodePattern)
+	// vendorCodePattern := regexp.MustCompile(cfg.VendorCodePattern)
 	// 7. Обрабатываем каждую карточку
 	for _, card := range allCards {
-		if !vendorCodePattern.MatchString(card.VendorCode) {
+		var matched bool
+		for _, pattern := range cfg.VendorCodePatterns {
+			if regexp.MustCompile(pattern).MatchString(card.VendorCode) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			log.Printf("Пропускаем товар с некорректным VendorCode: %s", card.VendorCode)
 			continue
 		}
+
 		skus := skuMap[card.NmID]
 		if len(skus) != 1 {
 			panic(fmt.Sprintf("SKU либо отсутствует, либо их больше 1 для товара с VendorCode: %s", card.VendorCode))
@@ -230,8 +268,9 @@ func Process(apiKey string, cfg Config) error {
 			productData = cachedData
 		} else {
 			log.Printf("Парсим страницу для товара: %s", productID)
-			url := baseURL + productID + "/"
-			productData, err = scrapeProductData(ctx, url)
+			// url := baseURL + productID + "/"
+			// productData, err = scrapeProductData(ctx, url)
+			productData, err = scrapeProductData(ctx, card.VendorCode)
 			if err != nil {
 				log.Printf("Ошибка при обработке товара %s: %v", productID, err)
 				continue
@@ -342,7 +381,77 @@ func extractSKUs(cards []Card) map[int][]string {
 	return skuMap
 }
 
-func scrapeProductData(ctx context.Context, url string) (map[string]string, error) {
+// func scrapeProductData(ctx context.Context, url string) (map[string]string, error) {
+// 1) Нужно учесть, что в CSV файле у вас указано "bubblebags_19336", а в карточке приходит "bubblebags_19336_100".
+//    То есть в CSV нет точного совпадения по ключу (vendorCode).
+//    Нам нужно отбросить последний "_число", чтобы искать по "bubblebags_19336", а не "bubblebags_19336_100".
+// 2) В scrapeProductData, когда паттерн совпал с ^bubblebags_1\d+_\d+$,
+//    замените поиск csvURL, ок := bubblebagsURLMap[vendorCode] на поиск по "префиксу без третьей части":
+
+func scrapeProductData(ctx context.Context, vendorCode string) (map[string]string, error) {
+	// Проверяем: ^bubblebags_1\d+_\d+$
+	matched, _ := regexp.MatchString(`^bubblebags_1\d+_\d+$`, vendorCode)
+	if matched {
+		// Пример: "bubblebags_19336_100"
+		// Нам нужно отбросить "_100", чтобы найти "bubblebags_19336" в CSV
+		baseKey := vendorCode
+		if idx := strings.LastIndex(baseKey, "_"); idx != -1 {
+			// baseKey = "bubblebags_19336"
+			baseKey = baseKey[:idx]
+		}
+
+		// Ищем URL в карте, загруженной из CSV
+		csvURL, ok := bubblebagsURLMap[baseKey]
+		if !ok {
+			log.Printf("Не найден URL для %s в urls.csv", vendorCode)
+			return map[string]string{"price": "0", "availableCount": "0"}, nil
+		}
+
+		// Делаем chromedp-скрапинг по csvURL
+		var htmlPrice, htmlStock string
+		err := chromedp.Run(ctx,
+			chromedp.Navigate(csvURL),
+			chromedp.Sleep(2*time.Second),
+			// Ищем наличие товара в <span class="stock">В наличии</span>
+			chromedp.Text(`div.quantity span.stock`, &htmlStock, chromedp.ByQuery),
+			// Ищем цену из кнопки data-count="1"
+			chromedp.Text(`button[data-count="1"] .col_right`, &htmlPrice, chromedp.ByQuery),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка при парсинге страницы %s: %v", csvURL, err)
+		}
+
+		// Проверяем наличие
+		var availableCount int
+		if strings.Contains(htmlStock, "В наличии") {
+			availableCount = 5
+		} else {
+			availableCount = 0
+		}
+
+		// Извлекаем число из htmlPrice (например, "23 руб.")
+		priceParts := strings.Fields(htmlPrice)
+		if len(priceParts) > 0 {
+			rawPrice := priceParts[0]
+			rawPrice = strings.ReplaceAll(rawPrice, "№", "")
+			rawPrice = strings.TrimSpace(rawPrice)
+			return map[string]string{
+				"price":          rawPrice,
+				"availableCount": fmt.Sprintf("%d", availableCount),
+			}, nil
+		}
+
+		return map[string]string{"price": "0", "availableCount": fmt.Sprintf("%d", availableCount)}, nil
+	}
+
+	// Остальной код для "box_\d+_\d+$" и т. д.
+	// (пример парсинга sp.cargo-avto.ru)
+	parts := strings.Split(vendorCode, "_")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("некорректный VendorCode: %s", vendorCode)
+	}
+	url := baseURL + parts[1] + "/"
+
 	var productPrice string
 	var availableStoresCount int
 
