@@ -53,15 +53,15 @@ func main() {
 		UsePcs: true,
 	}
 
-	err := Process(apiKey, cfg)
-	if err != nil {
-		log.Fatalf("Ошибка при обработке: %v", err)
-	}
+	// err := Process(apiKey, cfg)
+	// if err != nil {
+	// 	log.Fatalf("Ошибка при обработке: %v", err)
+	// }
 
-	err = updateStocks(apiKey, cfg)
-	if err != nil {
-		log.Fatalf("Ошибка при обновлении стоки: %v", err)
-	}
+	// err = updateStocks(apiKey, cfg)
+	// if err != nil {
+	// 	log.Fatalf("Ошибка при обновлении стоки: %v", err)
+	// }
 
 	if err := ozonUpdateStocks(cfg); err != nil {
 		fmt.Printf("Ошибка обновления остатков: %v\n", err)
@@ -674,6 +674,7 @@ func ozonUpdateStocks(cfg Config) error {
 		}
 		stocksData = append(stocksData, item)
 	}
+
 	// Получаем переменные окружения
 	apiKey := os.Getenv("OZON_API_KEY")
 	clientID := os.Getenv("OZON_CLIENT_ID")
@@ -689,54 +690,64 @@ func ozonUpdateStocks(cfg Config) error {
 		return fmt.Errorf("не удалось преобразовать WAREHOUSE_ID в число: %v", err)
 	}
 
-	// Формируем список остатков
-	var stocks []ozonStockUpdate
-	for _, item := range stocksData {
-		stocks = append(stocks, ozonStockUpdate{
-			OfferID:     item.Vendor,
-			Stock:       item.Amount,
-			WarehouseID: warehouseIDInt,
-		})
+	// Разбиваем массив на пачки по 100 элементов
+	chunkSize := 100
+	for i := 0; i < len(stocksData); i += chunkSize {
+		end := i + chunkSize
+		if end > len(stocksData) {
+			end = len(stocksData)
+		}
+
+		// Формируем список остатков
+		var stocks []ozonStockUpdate
+		for _, item := range stocksData[i:end] {
+			stocks = append(stocks, ozonStockUpdate{
+				OfferID:     item.Vendor,
+				Stock:       item.Amount,
+				WarehouseID: warehouseIDInt,
+			})
+		}
+
+		// Формируем тело запроса
+		payload := ozonStockRequest{Stocks: stocks}
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("не удалось сериализовать данные: %v", err)
+		}
+
+		// Создаем HTTP-запрос
+		url := "https://api-seller.ozon.ru/v2/products/stocks"
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(payloadBytes))
+		if err != nil {
+			return fmt.Errorf("ошибка при создании запроса: %v", err)
+		}
+
+		// Устанавливаем заголовки
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Client-Id", clientID)
+		req.Header.Set("Api-Key", apiKey)
+
+		// Отправляем запрос
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("ошибка при отправке запроса: %v", err)
+		}
+		defer resp.Body.Close()
+
+		// Читаем и выводим ответ
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("ошибка при чтении ответа: %v", err)
+		}
+
+		// Проверяем статус-код
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("ошибка обновления остатков: статус %d, ответ: %s", resp.StatusCode, string(body))
+		}
+
+		fmt.Printf("Остатки успешно обновлены для %d товаров\n", len(stocks))
 	}
 
-	// Формируем тело запроса
-	payload := ozonStockRequest{Stocks: stocks}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("не удалось сериализовать данные: %v", err)
-	}
-
-	// Создаем HTTP-клиент и запрос
-	url := "https://api-seller.ozon.ru/v2/products/stocks"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		return fmt.Errorf("ошибка при создании запроса: %v", err)
-	}
-
-	// Устанавливаем заголовки
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Client-Id", clientID)
-	req.Header.Set("Api-Key", apiKey)
-
-	// Отправляем запрос
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("ошибка при отправке запроса: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// Читаем и выводим ответ
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("ошибка при чтении ответа: %v", err)
-	}
-
-	// Проверяем статус-код
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ошибка обновления остатков: статус %d, ответ: %s", resp.StatusCode, string(body))
-	}
-
-	fmt.Printf("Успешное обновление остатков: %s\n", string(body))
 	return nil
 }
