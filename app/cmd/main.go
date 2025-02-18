@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math"
@@ -61,6 +62,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Ошибка при обновлении стоки: %v", err)
 	}
+
+	if err := ozonUpdateStocks(cfg); err != nil {
+		fmt.Printf("Ошибка обновления остатков: %v\n", err)
+	}
 }
 
 func loadBubblebagsCSV() error {
@@ -90,7 +95,7 @@ func updateStocks(apiKey string, cfg Config) error {
 	defer db.Close()
 
 	query := `
-        SELECT sku, pcs, available_count
+        SELECT vendor_code, sku, pcs, available_count
         FROM products
         WHERE sku IS NOT NULL
     `
@@ -105,10 +110,11 @@ func updateStocks(apiKey string, cfg Config) error {
 	for rows.Next() {
 		var (
 			skus           string
+			vendorCode     string
 			pcs            int
 			availableCount int
 		)
-		if err := rows.Scan(&skus, &pcs, &availableCount); err != nil {
+		if err := rows.Scan(&vendorCode, &skus, &pcs, &availableCount); err != nil {
 			log.Printf("Ошибка чтения строки: %v", err)
 			continue
 		}
@@ -116,6 +122,7 @@ func updateStocks(apiKey string, cfg Config) error {
 		amount := calcAmount(pcs, availableCount)
 		item := stockItem{
 			SKU:    skus,
+			Vendor: vendorCode,
 			Amount: amount,
 		}
 		stocksData = append(stocksData, item)
@@ -592,7 +599,9 @@ func saveToDatabase(db *sql.DB, params SaveParams, sku string) {
 }
 
 func calcAmount(pcs, availableCount int) int {
-	if availableCount == 5 && pcs == 50 {
+	if availableCount == 5 && pcs == 100 {
+		return 1
+	} else if availableCount == 5 && pcs == 50 {
 		return 1
 	} else if availableCount == 5 && pcs == 30 {
 		return 2
@@ -608,10 +617,126 @@ func calcAmount(pcs, availableCount int) int {
 
 type stockItem struct {
 	SKU    string `json:"sku"`
+	Vendor string `json:"vendor"`
 	Amount int    `json:"amount"`
 }
 
 // Структура для JSON, который отправляется в WB API
 type stockRequest struct {
 	Stocks []stockItem `json:"stocks"`
+}
+
+// OZON
+type ozonStockRequest struct {
+	Stocks []ozonStockUpdate `json:"stocks"`
+}
+type ozonStockUpdate struct {
+	OfferID     string `json:"offer_id"`
+	Stock       int    `json:"stock"`
+	WarehouseID int    `json:"warehouse_id"`
+}
+
+func ozonUpdateStocks(cfg Config) error {
+	db, err := sql.Open("sqlite", cfg.DBName)
+	if err != nil {
+		return fmt.Errorf("ошибка при открытии базы данных: %v", err)
+	}
+	defer db.Close()
+
+	query := `
+        SELECT vendor_code, pcs, available_count
+        FROM products
+        WHERE sku IS NOT NULL
+    `
+	rows, err := db.Query(query)
+	if err != nil {
+		return fmt.Errorf("ошибка при запросе к БД: %v", err)
+	}
+	defer rows.Close()
+
+	var stocksData []stockItem
+
+	for rows.Next() {
+		var (
+			vendorCode     string
+			pcs            int
+			availableCount int
+		)
+		if err := rows.Scan(&vendorCode, &pcs, &availableCount); err != nil {
+			log.Printf("Ошибка чтения строки: %v", err)
+			continue
+		}
+
+		amount := calcAmount(pcs, availableCount)
+		item := stockItem{
+			Vendor: vendorCode,
+			Amount: amount,
+		}
+		stocksData = append(stocksData, item)
+	}
+	// Получаем переменные окружения
+	apiKey := os.Getenv("OZON_API_KEY")
+	clientID := os.Getenv("OZON_CLIENT_ID")
+	warehouseID := os.Getenv("WAREHOUSE_ID")
+
+	if apiKey == "" || clientID == "" || warehouseID == "" {
+		return fmt.Errorf("необходимо установить переменные окружения: OZON_API_KEY, OZON_CLIENT_ID, WAREHOUSE_ID")
+	}
+
+	// Преобразуем warehouseID в int
+	warehouseIDInt, err := strconv.Atoi(warehouseID)
+	if err != nil {
+		return fmt.Errorf("не удалось преобразовать WAREHOUSE_ID в число: %v", err)
+	}
+
+	// Формируем список остатков
+	var stocks []ozonStockUpdate
+	for _, item := range stocksData {
+		stocks = append(stocks, ozonStockUpdate{
+			OfferID:     item.Vendor,
+			Stock:       item.Amount,
+			WarehouseID: warehouseIDInt,
+		})
+	}
+
+	// Формируем тело запроса
+	payload := ozonStockRequest{Stocks: stocks}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("не удалось сериализовать данные: %v", err)
+	}
+
+	// Создаем HTTP-клиент и запрос
+	url := "https://api-seller.ozon.ru/v2/products/stocks"
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("ошибка при создании запроса: %v", err)
+	}
+
+	// Устанавливаем заголовки
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Client-Id", clientID)
+	req.Header.Set("Api-Key", apiKey)
+
+	// Отправляем запрос
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("ошибка при отправке запроса: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Читаем и выводим ответ
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("ошибка при чтении ответа: %v", err)
+	}
+
+	// Проверяем статус-код
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ошибка обновления остатков: статус %d, ответ: %s", resp.StatusCode, string(body))
+	}
+
+	fmt.Printf("Успешное обновление остатков: %s\n", string(body))
+	return nil
 }
