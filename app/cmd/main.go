@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/xuri/excelize/v2"
 	_ "modernc.org/sqlite"
 )
 
@@ -27,7 +28,6 @@ const (
 	WarehouseID  = 1283008
 	BatchSize    = 1000
 	RequestLimit = 300 // 300 запросов в минуту
-
 )
 
 var bubblebagsURLMap = make(map[string]string)
@@ -41,8 +41,15 @@ func main() {
 		log.Fatalf("Ошибка загрузки URL из CSV: %v", err)
 	}
 
+	if err := loadDownloadData(); err != nil {
+		log.Fatalf("Ошибка чтения download.csv: %v", err)
+	}
+
 	cfg := Config{
-		ObjectIDs: []int{3979, 3756},
+		ObjectIDs: []int{1349},
+		FpPatterns: []string{
+			"^growme[cp]?t?_\\d+$",
+		},
 
 		DBName: "unit_ec.db",
 		VendorCodePatterns: []string{
@@ -53,19 +60,64 @@ func main() {
 		UsePcs: true,
 	}
 
-	// err := Process(apiKey, cfg)
-	// if err != nil {
-	// 	log.Fatalf("Ошибка при обработке: %v", err)
-	// }
+	err := Process(apiKey, cfg)
+	if err != nil {
+		log.Fatalf("Ошибка при обработке: %v", err)
+	}
 
-	// err = updateStocks(apiKey, cfg)
-	// if err != nil {
-	// 	log.Fatalf("Ошибка при обновлении стоки: %v", err)
-	// }
+	err = updateStocks(apiKey, cfg)
+	if err != nil {
+		log.Fatalf("Ошибка при обновлении стоки: %v", err)
+	}
 
 	if err := ozonUpdateStocks(cfg); err != nil {
 		fmt.Printf("Ошибка обновления остатков: %v\n", err)
 	}
+
+	updateXLSXPrices(cfg, "export_product_cost_data.xlsx")
+}
+func loadDownloadData() error {
+	f, err := os.Open("download.csv")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	isHeader := true
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isHeader {
+			isHeader = false // Пропускаем заголовок
+			continue
+		}
+
+		parts := strings.Split(line, ",")
+		if len(parts) < 3 {
+			log.Printf("Ошибка парсинга строки: %s", line)
+			continue
+		}
+
+		idVal, err1 := strconv.Atoi(parts[0])
+		priceVal, err2 := strconv.Atoi(parts[1])
+		qtyVal, err3 := strconv.Atoi(parts[2])
+		if err1 != nil || err2 != nil || err3 != nil {
+			log.Printf("Ошибка конвертации данных: %s", line)
+			continue
+		}
+
+		downloadCSVData[idVal] = DownloadRow{
+			Price:    priceVal,
+			Quantity: qtyVal,
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("ошибка при чтении download.csv: %v", err)
+	}
+
+	log.Printf("Загружено %d записей из download.csv", len(downloadCSVData))
+	return nil
 }
 
 func loadBubblebagsCSV() error {
@@ -193,14 +245,21 @@ func updateStocks(apiKey string, cfg Config) error {
 }
 
 type Config struct {
-	ObjectIDs []int // SubjectIDs
-
+	ObjectIDs          []int // SubjectIDs
+	FpPatterns         []string
 	DBName             string   // DBName (for example, "ue.db")
 	VendorCodePatterns []string // VendorCodePattern (for example, "^box_\d+_\d+$")
 	UsePcs             bool     // UsePcs (for example, true)
 }
 
 const baseURL = "https://sp.cargo-avto.ru/catalog/"
+
+var downloadCSVData = make(map[int]DownloadRow)
+
+type DownloadRow struct {
+	Price    int
+	Quantity int
+}
 
 func Process(apiKey string, cfg Config) error {
 
@@ -237,6 +296,42 @@ func Process(apiKey string, cfg Config) error {
 	// vendorCodePattern := regexp.MustCompile(cfg.VendorCodePattern)
 	// 7. Обрабатываем каждую карточку
 	for _, card := range allCards {
+		var isFpMatch bool
+		for _, fp := range cfg.FpPatterns {
+			matched, _ := regexp.MatchString(fp, card.VendorCode)
+			if matched {
+				isFpMatch = true
+				break
+			}
+		}
+
+		if isFpMatch {
+			// Если совпало, берём данные из downloadCSVData по nmID
+			row, exists := downloadCSVData[card.NmID]
+			if !exists {
+				log.Printf("В download.csv нет данных для nm_id=%d", card.NmID)
+				continue
+			}
+			// Для примера, Pcs при таком варианте пусть будет 1 (или как вам нужно)
+			pcsInt := 1
+			skuList := skuMap[card.NmID]
+			if len(skuList) != 1 {
+				log.Printf("FP-товар, но SKUs != 1 для nmID=%d!", card.NmID)
+				continue
+			}
+			// Сохраняем в БД
+			saveToDatabase(db, SaveParams{
+				NmID:              card.NmID,
+				VendorCode:        card.VendorCode,
+				Pcs:               pcsInt,
+				ProductID:         fmt.Sprintf("%d", card.NmID),
+				AvailableCountStr: strconv.Itoa(row.Quantity),
+				Cost:              row.Price,
+			}, skuList[0])
+
+			continue
+		}
+
 		var matched bool
 		for _, pattern := range cfg.VendorCodePatterns {
 			if regexp.MustCompile(pattern).MatchString(card.VendorCode) {
@@ -611,6 +706,8 @@ func calcAmount(pcs, availableCount int) int {
 		return 1
 	} else if availableCount == 4 && pcs == 10 {
 		return 3
+	} else if availableCount == 5 && pcs == 1 {
+		return 5
 	}
 	return 0
 }
@@ -747,6 +844,68 @@ func ozonUpdateStocks(cfg Config) error {
 		}
 
 		fmt.Printf("Остатки успешно обновлены для %d товаров\n", len(stocks))
+	}
+
+	return nil
+}
+
+func updateXLSXPrices(cfg Config, filePath string) error {
+	db, err := sql.Open("sqlite", cfg.DBName)
+	if err != nil {
+		return fmt.Errorf("ошибка при открытии базы данных: %v", err)
+	}
+	defer db.Close()
+	f, err := excelize.OpenFile(filePath)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть Excel-файл: %v", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	rows, err := f.GetRows("Sheet1")
+	if err != nil {
+		return fmt.Errorf("ошибка чтения строк Excel: %v", err)
+	}
+
+	// Пробегаемся по строкам, начиная со второй (первая может быть заголовком)
+	for rowIndex, row := range rows {
+		if rowIndex == 0 {
+			continue
+		}
+		if len(row) == 0 {
+			continue
+		}
+
+		// Извлекаем nmID из первой ячейки (A-столбец)
+		nmIDStr := row[0]
+		nmID, err := strconv.Atoi(nmIDStr)
+		if err != nil {
+			continue
+		}
+
+		// Ищем cost в БД
+		var cost int
+		err = db.QueryRow(`
+            SELECT cost
+            FROM products
+            WHERE nm_id = ?
+        `, nmID).Scan(&cost)
+		if err != nil {
+			// Ошибку сканирования пропускаем, если нет строки в БД, двигаемся дальше
+			continue
+		}
+
+		// Получаем координаты ячейки (второй столбец, текущая строка)
+		cellName, _ := excelize.CoordinatesToCellName(2, rowIndex+1)
+
+		// Устанавливаем новое значение cost (или cost как float64)
+		f.SetCellValue("Sheet1", cellName, float64(cost))
+	}
+
+	// Сохраняем изменения
+	if err := f.Save(); err != nil {
+		return fmt.Errorf("ошибка сохранения Excel: %v", err)
 	}
 
 	return nil
